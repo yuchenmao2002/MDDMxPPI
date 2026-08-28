@@ -56,7 +56,7 @@ from src.models.config import (
     MaskedDiffusionModelConfig,
     PerformerConfig,
 )
-from src.models.masked_diffusion_model import MaskedDiscreteDiffusionModel
+from src.models.masked_diffusion_training import MaskedDiffusionTrainingModule
 
 
 DEFAULT_DATA = PROJECT_ROOT / "data/processed/PBS/Parse_10M_PBMC_PBS_ln.h5ad"
@@ -657,10 +657,10 @@ def training_signature(args: argparse.Namespace) -> dict[str, Any]:
 
 def checkpoint_payload(
     *,
-    model: MaskedDiscreteDiffusionModel,
+    model: MaskedDiffusionTrainingModule,
     optimizer: AdamW,
     scheduler: LambdaLR,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: torch.amp.GradScaler,
     diffusion_generator: torch.Generator,
     model_config: MaskedDiffusionModelConfig,
     args: argparse.Namespace,
@@ -767,6 +767,18 @@ def validate_resume_checkpoint(
         )
 
 
+_SUFFICIENT_STATISTIC_FIELDS = (
+    "weighted_nll_sum",
+    "normalizer",
+    "weighted_zero_nll_sum",
+    "weighted_positive_nll_sum",
+    "masked_count",
+    "masked_zero_count",
+    "masked_positive_count",
+    "cell_count",
+)
+
+
 class MetricAccumulator:
     def __init__(self) -> None:
         self.weighted_nll_sum = 0.0
@@ -782,25 +794,36 @@ class MetricAccumulator:
     def from_output(cls, output: Any) -> "MetricAccumulator":
         """Materialize one microbatch's sufficient statistics exactly once."""
 
+        # Stack on the device and transfer once.  Eight separate ``.item()``
+        # calls each issue their own synchronizing device-to-host copy in the
+        # hot path.  FP64 is exact for both the FP32 sums and the int64 counts,
+        # which never approach 2**53.
+        packed = torch.stack(
+            [
+                getattr(output, field).detach().to(dtype=torch.float64)
+                for field in _SUFFICIENT_STATISTIC_FIELDS
+            ]
+        )
+        (
+            weighted_nll_sum,
+            normalizer,
+            weighted_zero_nll_sum,
+            weighted_positive_nll_sum,
+            masked_count,
+            masked_zero_count,
+            masked_positive_count,
+            cell_count,
+        ) = packed.tolist()
+
         accumulator = cls()
-        accumulator.weighted_nll_sum = float(
-            output.weighted_nll_sum.detach().item()
-        )
-        accumulator.normalizer = int(output.normalizer.detach().item())
-        accumulator.weighted_zero_nll_sum = float(
-            output.weighted_zero_nll_sum.detach().item()
-        )
-        accumulator.weighted_positive_nll_sum = float(
-            output.weighted_positive_nll_sum.detach().item()
-        )
-        accumulator.masked_count = int(output.masked_count.detach().item())
-        accumulator.masked_zero_count = int(
-            output.masked_zero_count.detach().item()
-        )
-        accumulator.masked_positive_count = int(
-            output.masked_positive_count.detach().item()
-        )
-        accumulator.cell_count = int(output.cell_count.detach().item())
+        accumulator.weighted_nll_sum = weighted_nll_sum
+        accumulator.normalizer = int(normalizer)
+        accumulator.weighted_zero_nll_sum = weighted_zero_nll_sum
+        accumulator.weighted_positive_nll_sum = weighted_positive_nll_sum
+        accumulator.masked_count = int(masked_count)
+        accumulator.masked_zero_count = int(masked_zero_count)
+        accumulator.masked_positive_count = int(masked_positive_count)
+        accumulator.cell_count = int(cell_count)
         return accumulator
 
     def merge(self, other: "MetricAccumulator") -> None:
@@ -849,11 +872,11 @@ def amp_settings(precision: str) -> tuple[bool, torch.dtype]:
 def train_one_epoch(
     *,
     runner: Any,
-    model: MaskedDiscreteDiffusionModel,
+    model: MaskedDiffusionTrainingModule,
     loader: DataLoader[Tensor],
     optimizer: AdamW,
     scheduler: LambdaLR,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: torch.amp.GradScaler,
     diffusion_generator: torch.Generator,
     device: torch.device,
     autocast_enabled: bool,
@@ -982,11 +1005,14 @@ def train_one_epoch(
             # number of cells keeps the accumulated gradient normalized by the
             # full group's cell-gene count, including a smaller final batch.
             loss = output.loss * (microbatch_cells / group_cells)
-        if not bool(torch.isfinite(output.loss).item()):
+        # ``loss`` is ``weighted_nll_sum / normalizer`` with a positive integer
+        # normalizer, so the host-side sum decides finiteness.  Reusing the
+        # single transfer above avoids a second synchronizing copy per batch.
+        microbatch_metrics = MetricAccumulator.from_output(output)
+        if not math.isfinite(microbatch_metrics.weighted_nll_sum):
             raise FloatingPointError(
                 f"Non-finite loss at epoch {epoch + 1}, batch {batch_index + 1}."
             )
-        microbatch_metrics = MetricAccumulator.from_output(output)
         metrics.merge(microbatch_metrics)
         accumulation_group_metrics.merge(microbatch_metrics)
         scaler.scale(loss).backward()
@@ -1062,7 +1088,7 @@ def train_one_epoch(
 def validate(
     *,
     runner: Any,
-    model: MaskedDiscreteDiffusionModel,
+    model: MaskedDiffusionTrainingModule,
     loader: DataLoader[Tensor],
     device: torch.device,
     autocast_enabled: bool,
@@ -1086,9 +1112,10 @@ def validate(
             enabled=autocast_enabled,
         ):
             output = runner(clean_expression, generator=validation_generator)
-        if not bool(torch.isfinite(output.loss).item()):
+        microbatch_metrics = MetricAccumulator.from_output(output)
+        if not math.isfinite(microbatch_metrics.weighted_nll_sum):
             raise FloatingPointError("Validation produced a non-finite loss.")
-        metrics.update(output)
+        metrics.merge(microbatch_metrics)
         if STOP_REQUEST.requested:
             result = metrics.result()
             result[PRIMARY_VALIDATION_METRIC] = result["loss"]
@@ -1222,7 +1249,7 @@ def main() -> int:
     }
 
     model_config = build_model_config(args)
-    model = MaskedDiscreteDiffusionModel.from_config(model_config).to(device)
+    model = MaskedDiffusionTrainingModule.from_config(model_config).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     trainable_parameter_count = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
@@ -1246,7 +1273,7 @@ def main() -> int:
         warmup_ratio=args.warmup_ratio,
         min_lr_ratio=args.min_lr_ratio,
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=args.precision == "fp16")
+    scaler = torch.amp.GradScaler("cuda", enabled=args.precision == "fp16")
     diffusion_generator = torch.Generator(device=device)
     diffusion_generator.manual_seed(args.seed + 1)
     validation_seed = args.seed + VALIDATION_SEED_OFFSET

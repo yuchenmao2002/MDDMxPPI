@@ -1,14 +1,10 @@
-"""Typed configuration and cross-component invariants for the v2 model.
-
-This module is the single source of truth for dimensions that cross component
-boundaries.  In particular, the processed PBS vocabulary always contains
-19,295 genes, the Geneformer initialization has width 1,152, and the v2 model
-width is 512.  Component implementations must reject incompatible values
-instead of silently reshaping or truncating tensors.
-
-The project currently has no Hydra/OmegaConf dependency.  Frozen standard
-library dataclasses are therefore used so configuration remains explicit and
-serializable without introducing a framework dependency.
+"""
+Typed Configuration and Cross-component Invariants
+This module is the single source of truth for dimensions that cross component boundaries.
+The processed gene vocabulary always contains 19,295 genes,
+the Geneformer initialization has width 1,152,
+and the model width is 512.
+Component implementations must reject incompatible values instead of silently reshaping or truncating tensors.
 """
 
 from __future__ import annotations
@@ -30,12 +26,8 @@ ARCHITECTURE_VERSION = "masked-expression-diffusion-v2-hurdle-truncated-normal"
 
 @dataclass(frozen=True)
 class GeneIdentityEncoderConfig:
-    """Configuration for the fixed-vocabulary Gene Identity Encoder.
-
-    The source table remains a trainable ``[num_genes, source_dim]`` embedding.
-    A shared, bias-free projection maps it to ``d_model``.  For v2 this means
-    ``[19295,1152] -> [19295,512]``.  The projection is part of the model and
-    must be checkpointed together with the updated source table.
+    """
+    Configuration for the fixed-vocabulary Gene Identity Encoder.
     """
 
     weights_path: Path = Path(
@@ -48,7 +40,7 @@ class GeneIdentityEncoderConfig:
     num_genes: int = NUM_GENES
     source_dim: int = GENEFORMER_EMBEDDING_DIM
     d_model: int = DEFAULT_D_MODEL
-    trainable: bool = True
+    trainable: bool = False
     projection_bias: bool = False
     projection_seed: int = 0
     verify_sha256: bool = True
@@ -109,13 +101,9 @@ class ForwardProcessConfig:
 
 @dataclass(frozen=True)
 class PerformerConfig:
-    """Configuration shared by all standard Performer blocks in v2.
-
-    ``num_layers`` is intentionally required: L is an experiment hyperparameter
-    rather than an architectural constant.  Random-feature projections are
-    fixed by default and stored as persistent buffers.  A non-``None`` redraw
-    interval may be supported later by the trainer, but redraw must never happen
-    implicitly inside ``forward``.
+    """
+    Configuration shared by all standard Performer blocks.
+    Random-feature projections are fixed by default and stored as persistent buffers.
     """
 
     num_layers: int
@@ -128,7 +116,7 @@ class PerformerConfig:
     sequence_chunk_size: int = 8_192
     projection_seed: int = 0
     feature_redraw_interval: Optional[int] = None
-    activation_checkpointing: bool = False
+    activation_checkpointing: bool = True
 
     def __post_init__(self) -> None:
         if self.num_layers <= 0:
@@ -168,12 +156,14 @@ class PerformerConfig:
 
 @dataclass(frozen=True)
 class DecoderConfig:
-    """Configuration for the shared probabilistic expression readout.
-
-    The three raw channels are, in order, the positive/detection logit, the
-    positive-component location, and an unconstrained scale parameter.  The
-    decoder transforms the last channel with ``min_scale + softplus(raw)`` and
-    models positive values with a Normal distribution truncated to ``(0,inf)``.
+    """
+    Configuration for the shared probabilistic expression readout.
+    The three raw channels are, in order,
+    the positive/detection logit,
+    the positive-component location,
+    and an unconstrained scale parameter.
+    The decoder transforms the last channel with ``min_scale + softplus(raw)``
+    and models positive values with a Normal distribution truncated to (0,inf).
     These values are fixed architecture semantics, not experiment knobs.
     """
 
@@ -222,7 +212,7 @@ class LossConfig:
 
 @dataclass(frozen=True)
 class MaskedDiffusionModelConfig:
-    """Complete v2 configuration with cross-component validation."""
+    """Complete configuration with cross-component validation."""
 
     performer: PerformerConfig
     gene_identity: GeneIdentityEncoderConfig = field(
@@ -249,10 +239,6 @@ class MaskedDiffusionModelConfig:
             )
         if self.gene_identity.num_genes != self.forward_process.num_genes:
             raise ValueError("Gene vocabulary and forward-process sizes must match.")
-        if not self.gene_identity.trainable:
-            raise ValueError(
-                "The v2 Geneformer source embedding must remain trainable."
-            )
         if self.gene_identity.projection_bias:
             raise ValueError("The v2 1152-to-512 gene projection must be bias-free.")
         if self.performer.feature_redraw_interval is not None:

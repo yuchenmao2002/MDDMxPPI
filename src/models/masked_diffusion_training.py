@@ -1,10 +1,7 @@
-"""Training-time assembly for masked expression diffusion.
-
-The deterministic denoiser consumes an explicitly specified state.  This thin
-training wrapper owns random forward corruption and the time-weighted
-hurdle-density objective; it does not execute sampling.  Reverse-time sampling
-is implemented separately in ``src.models.reverse_sampler`` so the inference
-algorithm does not become a dependency of the training model.
+"""
+Training-time Assembly for Masked Expression Diffusion
+The deterministic denoiser consumes an explicitly specified state.
+This thin training wrapper owns random forward corruption and the time-weighted hurdle-density objective.
 """
 
 from __future__ import annotations
@@ -21,42 +18,27 @@ from src.models.types import TrainingOutput
 from src.utils.tensor_validation import (
     validate_diffusion_mask,
     validate_diffusion_time,
-    validate_expression_tensor,
 )
 
 
-class MaskedDiscreteDiffusionModel(nn.Module):
-    """Training-time wrapper around the deterministic denoiser.
-
-    If time and mask are supplied, they are used verbatim after validation.  If
-    neither is supplied, this wrapper samples per-cell Uniform times and
-    conditionally independent masks.  Passing a mask without its matching time
-    is invalid.  The clean expression tensor is both the visible-state source
-    and the loss target, but masked values are removed inside the denoiser before
-    any cross-gene operation.
-
-    The current Performer has no block auxiliary losses, so
-    ``loss == reconstruction_loss``.
-    Future auxiliary losses remain separately exposed and must not be silently
-    added without explicit configured weights.
+class MaskedDiffusionTrainingModule(nn.Module):
+    """
+    Training-time wrapper around the deterministic denoiser.
+    If time and mask are supplied, they are used verbatim after validation.
+    If neither is supplied, this wrapper samples per-cell Uniform times and conditionally independent masks.
+    Passing a mask without its matching time is invalid.
+    The clean expression tensor is both the visible-state source and the loss target, but masked values are removed inside the denoiser before any cross-gene operation.
     """
 
-    def __init__(
-        self,
-        denoiser: MaskedExpressionDenoiser,
-        forward_process: AbsorbingMaskForwardProcess,
-        reconstruction_loss: TimeWeightedHurdleNLLLoss,
-    ) -> None:
+    def __init__(self, denoiser: MaskedExpressionDenoiser, forward_process: AbsorbingMaskForwardProcess, reconstruction_loss: TimeWeightedHurdleNLLLoss) -> None:
         super().__init__()
         self.denoiser = denoiser
         self.forward_process = forward_process
         self.reconstruction_loss = reconstruction_loss
 
+
     @classmethod
-    def from_config(
-        cls,
-        config: MaskedDiffusionModelConfig,
-    ) -> "MaskedDiscreteDiffusionModel":
+    def from_config(cls, config: MaskedDiffusionModelConfig) -> "MaskedDiffusionTrainingModule":
         """Assemble forward process, denoiser and objective from one config."""
 
         return cls(
@@ -65,36 +47,23 @@ class MaskedDiscreteDiffusionModel(nn.Module):
             reconstruction_loss=TimeWeightedHurdleNLLLoss(config.loss),
         )
 
-    def forward(
-        self,
-        clean_expression: Tensor,
-        *,
-        diffusion_time: Optional[Tensor] = None,
-        diffusion_mask: Optional[Tensor] = None,
-        generator: Optional[Generator] = None,
-        return_diagnostics: bool = False,
-    ) -> TrainingOutput:
-        """Corrupt, denoise and locally score a clean training batch.
 
-        The hurdle NLL is evaluated only at diffusion-masked positions, weighted
-        by ``1/t`` and normalized by the fixed local ``B*G``.  Returned weighted
-        sums and counts are local sufficient statistics.  This method does not
-        perform distributed collectives or optimizer-step decisions; those
-        belong to the trainer.
+    def forward(self, clean_expression: Tensor, *, diffusion_time: Optional[Tensor] = None, diffusion_mask: Optional[Tensor] = None, generator: Optional[Generator] = None, return_diagnostics: bool = False) -> TrainingOutput:
+        """
+        Corrupt, denoise and locally score a clean training batch.
+        The hurdle NLL is evaluated only at diffusion-masked positions, weighted by 1/t
+        and normalized by the fixed local B*G.
+        Returned weighted sums and counts are local sufficient statistics.
         """
 
-        validate_expression_tensor(
-            clean_expression,
-            num_genes=self.denoiser.num_genes,
-            name="clean_expression",
-        )
         batch_size = clean_expression.shape[0]
-
         if diffusion_mask is not None and diffusion_time is None:
             raise ValueError(
                 "diffusion_time is required when diffusion_mask is supplied."
             )
 
+        # 逻辑分支 1
+        # 没有提供掩码（正常训练情况）
         if diffusion_mask is None:
             forward_state = self.forward_process.sample(
                 batch_size,
@@ -104,6 +73,8 @@ class MaskedDiscreteDiffusionModel(nn.Module):
             )
             diffusion_time = forward_state.diffusion_time
             diffusion_mask = forward_state.diffusion_mask
+        # 逻辑分支 2
+        # 提供了掩码（用于特定测试或固定状态训练）
         else:
             # Both are non-None because the mask-without-time case is rejected.
             validate_diffusion_time(diffusion_time, batch_size=batch_size)
@@ -133,6 +104,7 @@ class MaskedDiscreteDiffusionModel(nn.Module):
             ):
                 raise ValueError("Rows at t=1 must be entirely diffusion-masked.")
 
+        # 将干净的数据、扩散时间和掩码传入去噪器
         model_output = self.denoiser(
             clean_expression,
             diffusion_time,
@@ -142,13 +114,9 @@ class MaskedDiscreteDiffusionModel(nn.Module):
             return_diagnostics=return_diagnostics,
             compute_point_prediction=False,
         )
-        if model_output.decoder_output is None:
-            raise RuntimeError("Denoiser did not preserve its DecoderOutput.")
+
+        # 计算损失
         parameters = model_output.decoder_output.distribution_parameters
-        if parameters is None:
-            raise RuntimeError(
-                "Hurdle distribution parameters are required to compute the loss."
-            )
         reconstruction = self.reconstruction_loss(
             parameters,
             clean_expression,
@@ -169,9 +137,8 @@ class MaskedDiscreteDiffusionModel(nn.Module):
             weighted_positive_nll_sum=(
                 reconstruction.weighted_positive_nll_sum
             ),
-            # The training/NLL path intentionally never computes the hurdle
-            # distribution mean.  Direct denoiser calls retain the default
-            # inference behavior and return it.
+            # The training/NLL path intentionally never computes the hurdle distribution mean.
+            # Direct denoiser calls retain the default inference behavior and return it.
             prediction=None,
             diffusion_time=diffusion_time,
             diffusion_mask=diffusion_mask,

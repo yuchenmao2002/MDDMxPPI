@@ -10,12 +10,12 @@ computing a point prediction.  Direct denoising can optionally report the
 distribution expectation for metrics or deterministic imputation.
 """
 
-from src.models.masked_diffusion_model import MaskedDiscreteDiffusionModel
+from src.models.masked_diffusion_training import MaskedDiffusionTrainingModule
 from src.models.masked_expression_denoiser import MaskedExpressionDenoiser
 from src.models.reverse_sampler import ReverseSampler, SamplingConfig
 
 __all__ = [
-    "MaskedDiscreteDiffusionModel",
+    "MaskedDiffusionTrainingModule",
     "MaskedExpressionDenoiser",
     "ReverseSampler",
     "SamplingConfig",

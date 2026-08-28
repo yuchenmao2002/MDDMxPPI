@@ -180,8 +180,9 @@ def _sample_standard_normal_above(
 
     if lower_bound.dtype != torch.float32:
         raise TypeError("lower_bound must have dtype torch.float32.")
-    if not bool(torch.isfinite(lower_bound).all().item()):
-        raise ValueError("lower_bound must contain only finite values.")
+    # The sole caller saturates its input with ``nan_to_num`` before this point,
+    # so a finiteness scan here would only add a synchronizing device-to-host
+    # copy inside the per-step sampling loop.
 
     flat_bound = lower_bound.reshape(-1)
     samples = torch.empty_like(flat_bound)
@@ -278,12 +279,9 @@ def sample_zero_truncated_normal(
         raise ValueError("location and scale must be on the same device.")
     if location.dtype != torch.float32 or scale.dtype != torch.float32:
         raise TypeError("location and scale must have dtype torch.float32.")
-    if not bool(torch.isfinite(location).all().item()):
-        raise ValueError("location must contain only finite values.")
-    if not bool(torch.isfinite(scale).all().item()):
-        raise ValueError("scale must contain only finite values.")
-    if bool((scale <= 0.0).any().item()):
-        raise ValueError("scale must be strictly positive.")
+    # Finiteness and strict positivity are contracts of the decoder's hurdle
+    # parameters; ``sample_hurdle_distribution`` is the only production caller
+    # and repeating the scans here costs three synchronizing copies per step.
     _validate_generator_device(generator, location.device)
 
     # Division can overflow even for individually finite decoder parameters.
@@ -341,14 +339,14 @@ def sample_hurdle_distribution(
             raise TypeError(f"{name} must have dtype torch.float32.")
         if tensor.ndim != 3 or tensor.shape[-1] != 1:
             raise ValueError(f"{name} must have shape [B,G,1].")
-        if not bool(torch.isfinite(tensor).all().item()):
-            raise ValueError(f"{name} must contain only finite values.")
     if location.shape != logits.shape or scale.shape != logits.shape:
         raise ValueError("All hurdle parameter tensors must have identical shapes.")
     if location.device != logits.device or scale.device != logits.device:
         raise ValueError("All hurdle parameter tensors must share a device.")
-    if bool((scale <= 0.0).any().item()):
-        raise ValueError("positive_scale must be strictly positive.")
+    # Shape, dtype and device are checked because they cost nothing.  Elementwise
+    # finiteness and ``scale > 0`` are not: the decoder derives scale as
+    # ``min_scale + softplus(raw)`` and emits FP32 parameters outside autocast,
+    # so those scans would only synchronize the reverse loop once per step.
     _validate_generator_device(generator, logits.device)
 
     expected_mask_shape = logits.shape[:-1]
@@ -370,7 +368,12 @@ def sample_hurdle_distribution(
         raise ValueError("selection_mask and hurdle parameters must share a device.")
 
     result = torch.zeros_like(logits, dtype=torch.float32)
-    selected_logits = logits.squeeze(-1).masked_select(selection_mask)
+    # Materialize the selection once as an index tuple.  Every data-dependent
+    # output size forces a device-to-host copy, so three ``masked_select`` calls
+    # sharing one mask -- plus the later boolean indexing -- would synchronize
+    # the reverse loop six times per step instead of twice.
+    selection_index = selection_mask.nonzero(as_tuple=True)
+    selected_logits = logits.squeeze(-1)[selection_index]
     if selected_logits.numel() == 0:
         return result
 
@@ -381,13 +384,14 @@ def sample_hurdle_distribution(
         generator=generator,
     )
     selected_positive = detection_uniform < torch.sigmoid(selected_logits)
+    positive_index = selected_positive.nonzero(as_tuple=True)[0]
     selected_values = torch.zeros_like(selected_logits)
-    if bool(selected_positive.any().item()):
-        selected_location = location.squeeze(-1).masked_select(selection_mask)
-        selected_scale = scale.squeeze(-1).masked_select(selection_mask)
-        selected_values[selected_positive] = sample_zero_truncated_normal(
-            selected_location[selected_positive],
-            selected_scale[selected_positive],
+    if positive_index.numel() > 0:
+        # ``numel`` is already known on the host after ``nonzero``, and indexing
+        # with an explicit index tensor keeps every later shape static.
+        selected_values[positive_index] = sample_zero_truncated_normal(
+            location.squeeze(-1)[selection_index][positive_index],
+            scale.squeeze(-1)[selection_index][positive_index],
             generator=generator,
         )
     result.squeeze(-1).masked_scatter_(selection_mask, selected_values)

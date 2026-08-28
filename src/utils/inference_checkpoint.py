@@ -39,7 +39,7 @@ from src.models.gene_expression_decoder import GeneExpressionDecoder
 from src.models.gene_expression_encoder import GeneExpressionEncoder
 from src.models.gene_identity_encoder import GeneIdentityEncoder
 from src.models.losses import TimeWeightedHurdleNLLLoss
-from src.models.masked_diffusion_model import MaskedDiscreteDiffusionModel
+from src.models.masked_diffusion_training import MaskedDiffusionTrainingModule
 from src.models.masked_expression_denoiser import MaskedExpressionDenoiser
 from src.models.masking import AbsorbingMaskForwardProcess, AbsorbingStateEmbedding
 from src.utils.checkpoint import sha256_file
@@ -73,7 +73,7 @@ class InferenceCheckpointMetadata:
 class LoadedInferenceModel:
     """Fresh strict-loaded model and its immutable checkpoint provenance."""
 
-    model: MaskedDiscreteDiffusionModel
+    model: MaskedDiffusionTrainingModule
     metadata: InferenceCheckpointMetadata
 
 
@@ -174,7 +174,7 @@ def _validate_state_dict(value: Any) -> Mapping[str, Tensor]:
 def _build_model_from_state(
     config: MaskedDiffusionModelConfig,
     state_dict: Mapping[str, Tensor],
-) -> MaskedDiscreteDiffusionModel:
+) -> MaskedDiffusionTrainingModule:
     """Build without reopening the original Geneformer initialization assets."""
 
     initial_weight = state_dict.get(_IDENTITY_WEIGHT_KEY)
@@ -205,7 +205,7 @@ def _build_model_from_state(
         backbone=build_performer_backbone(config.performer),
         decoder=GeneExpressionDecoder(config.decoder),
     )
-    model = MaskedDiscreteDiffusionModel(
+    model = MaskedDiffusionTrainingModule(
         denoiser=denoiser,
         forward_process=AbsorbingMaskForwardProcess(config.forward_process),
         reconstruction_loss=TimeWeightedHurdleNLLLoss(config.loss),

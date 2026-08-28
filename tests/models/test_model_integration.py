@@ -8,12 +8,12 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 import src.models.losses as losses_module
-import src.models.masked_diffusion_model as model_module
+import src.models.masked_diffusion_training as model_module
 import src.models.masked_expression_denoiser as denoiser_module
 from src.models.config import LossConfig
 from src.models.losses import TimeWeightedHurdleNLLLoss
-from src.models.masked_diffusion_model import (
-    MaskedDiscreteDiffusionModel,
+from src.models.masked_diffusion_training import (
+    MaskedDiffusionTrainingModule,
     MaskedExpressionDenoiser as LegacyMaskedExpressionDenoiser,
 )
 from src.models.masked_expression_denoiser import MaskedExpressionDenoiser
@@ -243,7 +243,7 @@ def test_training_wrapper_state_supply_rules_and_zero_mask(monkeypatch) -> None:
     monkeypatch.setattr(losses_module, "NUM_GENES", num_genes)
     process = _RecordingForwardProcess(num_genes)
     criterion = _RecordingHurdleLoss(TimeWeightedHurdleNLLLoss(LossConfig()))
-    model = MaskedDiscreteDiffusionModel(
+    model = MaskedDiffusionTrainingModule(
         denoiser=denoiser,
         forward_process=process,
         reconstruction_loss=criterion,
