@@ -189,8 +189,15 @@ def build_spherical_ppi_embedding(
     eigenvectors = eigenvectors[:, order]
     if not bool(torch.all(eigenvalues > 0)):
         raise RuntimeError(f"P 的正特征值不足请求的嵌入秩 r={rank}")
+
+    # 特征向量的整体符号是任意的；固定为「每列绝对值最大的分量为正」，
+    # 使不同超参数下产出的 eigenvectors 可以直接比较。
+    pivot = eigenvectors.abs().argmax(dim=0)
+    column = torch.arange(rank, device=compute_device)
+    eigenvectors = eigenvectors * eigenvectors[pivot, column].sign()
+
     raw_embedding = eigenvectors * eigenvalues.sqrt().unsqueeze(0)
-    del ppmi, initial, eigenvectors
+    del ppmi, initial
 
     # 第六步：按原始行范数识别退化集合；其余行去均值并投影到单位球面。
     raw_norm = torch.linalg.vector_norm(raw_embedding, dim=1)
@@ -221,6 +228,7 @@ def build_spherical_ppi_embedding(
         "free_mask": free_mask,
         "row_mean": row_mean,
         "eigenvalues": eigenvalues,
+        "eigenvectors": eigenvectors,
     }
     return {name: tensor.detach().cpu().contiguous() for name, tensor in tensors.items()}
 
@@ -268,7 +276,7 @@ def save_embedding(
 
     save_file(tensors, str(tensor_path))
     provenance = {
-        "schema_version": "spherical_ppi_embedding.v1",
+        "schema_version": "spherical_ppi_embedding.v2",
         "artifact_type": "spherical_ppi_embedding",
         "tensor_file": tensor_path.name,
         "safetensors_sha256": _sha256_file(tensor_path),
