@@ -8,7 +8,6 @@ import torch
 
 import src.models.gene_expression_decoder as decoder_module
 import src.models.gene_expression_encoder as expression_module
-import src.models.losses as losses_module
 from src.models.config import DecoderConfig, GeneExpressionEncoderConfig, LossConfig
 from src.models.gene_expression_decoder import GeneExpressionDecoder
 from src.models.gene_expression_encoder import GeneExpressionEncoder
@@ -277,7 +276,6 @@ def test_decoder_all_three_projection_channels_receive_gradients(monkeypatch) ->
 def test_real_decoder_and_hurdle_nll_train_all_three_channels(monkeypatch) -> None:
     num_genes = 4
     monkeypatch.setattr(decoder_module, "NUM_GENES", num_genes)
-    monkeypatch.setattr(losses_module, "NUM_GENES", num_genes)
     decoder = GeneExpressionDecoder(DecoderConfig(d_model=6))
     criterion = TimeWeightedHurdleNLLLoss(LossConfig())
     with torch.no_grad():

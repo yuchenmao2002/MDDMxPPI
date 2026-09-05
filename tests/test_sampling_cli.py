@@ -34,11 +34,15 @@ class _FakeSampler:
 
 
 def _metadata(tmp_path: Path) -> InferenceCheckpointMetadata:
+    model_config = MaskedDiffusionModelConfig(
+        backbone=PerformerConfig(num_layers=1),
+        backbone_variant="performer",
+    )
     return InferenceCheckpointMetadata(
         checkpoint_path=tmp_path / "best.pt",
         checkpoint_sha256="c" * 64,
-        checkpoint_format_version=3,
-        architecture_version="masked-expression-diffusion-v2-hurdle-truncated-normal",
+        checkpoint_format_version=4,
+        architecture_version=model_config.architecture_version,
         reason="epoch_end",
         current_epoch=2,
         epoch_completed=True,
@@ -46,10 +50,9 @@ def _metadata(tmp_path: Path) -> InferenceCheckpointMetadata:
         global_step=123,
         primary_validation_metric="val_time_weighted_hurdle_nll",
         best_primary_validation_metric=0.25,
-        model_config=MaskedDiffusionModelConfig(
-            performer=PerformerConfig(num_layers=1)
-        ),
+        model_config=model_config,
         data_contract={"n_vars": 3, "gene_order_sha256": "d" * 64},
+        ppi_asset_contract=None,
     )
 
 
@@ -165,6 +168,12 @@ def test_h5ad_output_preserves_sparse_values_gene_order_and_provenance(
     ]
     assert restored.uns["ppil_generation"]["num_steps"] == 2
     assert restored.uns["ppil_generation"]["gene_mapping_sha256"] == "e" * 64
+    # The generated file records which of the four backbones produced it.
+    assert restored.uns["ppil_generation"]["backbone_variant"] == "performer"
+    assert restored.uns["ppil_generation"]["backbone_signature"] == "performer*1"
+    assert restored.uns["ppil_generation"]["architecture_version"].startswith(
+        "performer*1|"
+    )
     assert "not raw integer counts" in restored.uns["ppil_generation"][
         "expression_domain"
     ]

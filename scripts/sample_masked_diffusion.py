@@ -37,7 +37,7 @@ import pandas as pd
 from scipy import sparse
 import torch
 
-from src.models.config import NUM_GENES
+from src.models.config import BACKBONE_VARIANTS, NUM_GENES
 from src.models.reverse_sampler import (
     ReverseSampler,
     SamplingConfig,
@@ -96,11 +96,21 @@ def build_parser() -> argparse.ArgumentParser:
         default="gzip",
     )
     parser.add_argument(
+        "--expect-backbone-variant",
+        choices=BACKBONE_VARIANTS,
+        default=None,
+        help=(
+            "Optional assertion about which of the interchangeable backbones "
+            "this checkpoint holds. When given, a mismatch is reported by name "
+            "instead of surfacing as a wall of missing state-dict keys."
+        ),
+    )
+    parser.add_argument(
         "--trust-checkpoint",
         action="store_true",
         help=(
             "Required confirmation that this project checkpoint is trusted. "
-            "Training checkpoint v3 requires unrestricted pickle loading."
+            "Training checkpoint v4 requires unrestricted pickle loading."
         ),
     )
     parser.add_argument(
@@ -346,6 +356,13 @@ def build_anndata(
         "primary_validation_metric": metadata.primary_validation_metric,
         "best_primary_validation_metric": metadata.best_primary_validation_metric,
         "architecture_version": metadata.architecture_version,
+        "backbone_variant": metadata.backbone_variant,
+        "backbone_signature": metadata.backbone_signature,
+        "ppi_asset_contract": (
+            dict(metadata.ppi_asset_contract)
+            if metadata.ppi_asset_contract is not None
+            else {}
+        ),
         "num_cells": num_cells,
         "num_steps": num_steps,
         "schedule": schedule,
@@ -441,7 +458,23 @@ def main() -> int:
         checkpoint_path,
         device=device,
         trust_checkpoint=args.trust_checkpoint,
+        expected_backbone_variant=args.expect_backbone_variant,
     )
+    print(
+        f"Backbone: {loaded.metadata.backbone_variant} "
+        f"({loaded.metadata.backbone_signature}); architecture "
+        f"{loaded.metadata.architecture_version}",
+        flush=True,
+    )
+    if loaded.metadata.ppi_asset_contract is not None:
+        print(
+            "PPI assets: embedding "
+            f"{loaded.metadata.ppi_asset_contract['embedding_sha256'][:12]}, "
+            "routing "
+            f"{loaded.metadata.ppi_asset_contract['routing_sha256'][:12]} "
+            "(tensors were restored from the checkpoint, not from data/)",
+            flush=True,
+        )
     if not loaded.metadata.epoch_completed:
         raise ValueError(
             "The selected checkpoint was saved during an incomplete epoch. "

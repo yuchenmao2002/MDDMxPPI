@@ -50,11 +50,14 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 
 from src.models.config import (
-    ARCHITECTURE_VERSION,
+    BACKBONE_CONFIG_TYPES,
+    BACKBONE_VARIANT_PERFORMER,
+    BACKBONE_VARIANTS,
     NUM_GENES,
+    PPI_BACKBONE_VARIANTS,
     GeneIdentityEncoderConfig,
     MaskedDiffusionModelConfig,
-    PerformerConfig,
+    PPIAssetConfig,
 )
 from src.models.masked_diffusion_training import MaskedDiffusionTrainingModule
 
@@ -67,7 +70,17 @@ DEFAULT_GENE_WEIGHTS = (
 DEFAULT_GENE_MANIFEST = (
     PROJECT_ROOT / "data/processed/Geneformer/hgnc_V2_embeddings_manifest.json"
 )
-CHECKPOINT_FORMAT_VERSION = 3
+DEFAULT_PPI_EMBEDDING = (
+    PROJECT_ROOT / "data/processed/PPI/spherical_ppi_tau700_k4_b1_r64.safetensors"
+)
+DEFAULT_PPI_EMBEDDING_MANIFEST = (
+    PROJECT_ROOT / "data/processed/PPI/spherical_ppi_tau700_k4_b1_r64.json"
+)
+DEFAULT_PPI_ROUTING = PROJECT_ROOT / "data/processed/PPI/ppi_moe_routing.safetensors"
+DEFAULT_PPI_ROUTING_MANIFEST = PROJECT_ROOT / "data/processed/PPI/ppi_moe_routing.json"
+# v4 renamed model_config.performer to backbone, added backbone_variant and ppi,
+# and made architecture_version a derived value rather than a stored field.
+CHECKPOINT_FORMAT_VERSION = 4
 PRIMARY_VALIDATION_METRIC = "val_time_weighted_hurdle_nll"
 VALIDATION_SEED_OFFSET = 100_000
 
@@ -135,6 +148,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     model = parser.add_argument_group("model")
+    model.add_argument(
+        "--backbone-variant",
+        choices=BACKBONE_VARIANTS,
+        default=BACKBONE_VARIANT_PERFORMER,
+        help=(
+            "Which interchangeable backbone to train. 'performer' is the "
+            "baseline; the three 'ppil_*' variants read the shared PPI assets."
+        ),
+    )
     model.add_argument("--num-layers", type=int, default=6)
     model.add_argument("--num-random-features", type=int, default=256)
     model.add_argument("--sequence-chunk-size", type=int, default=8192)
@@ -142,7 +164,12 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument(
         "--activation-checkpointing",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
+        help=(
+            "Recompute block activations in the backward pass. On by default "
+            "because six layers need roughly 113 GiB without it; pass "
+            "--no-activation-checkpointing only when that fits."
+        ),
     )
     model.add_argument("--gene-weights-path", type=Path, default=DEFAULT_GENE_WEIGHTS)
     model.add_argument(
@@ -157,6 +184,43 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
     )
     model.add_argument(
+        "--ppi-embedding-path",
+        type=Path,
+        default=DEFAULT_PPI_EMBEDDING,
+        help="Spherical PPI embedding; read only by the ppil_* backbones.",
+    )
+    model.add_argument(
+        "--ppi-embedding-manifest-path",
+        type=Path,
+        default=DEFAULT_PPI_EMBEDDING_MANIFEST,
+    )
+    model.add_argument(
+        "--ppi-routing-path",
+        type=Path,
+        default=DEFAULT_PPI_ROUTING,
+        help="Static MoE routing table; read only by the ppil_* backbones.",
+    )
+    model.add_argument(
+        "--ppi-routing-manifest-path",
+        type=Path,
+        default=DEFAULT_PPI_ROUTING_MANIFEST,
+    )
+    model.add_argument(
+        "--verify-ppi-asset-sha256",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    model.add_argument(
+        "--expert-ffn-multiplier",
+        type=int,
+        default=2,
+        help=(
+            "Hidden width of one routed expert as a multiple of d_model. The "
+            "default keeps per-token compute equal to the dense baseline under "
+            "top-2 routing. Ignored unless the backbone uses the routed FFN."
+        ),
+    )
+    model.add_argument(
         "--torch-compile",
         action="store_true",
         help="Experimental: validation-heavy model contracts may cause graph breaks.",
@@ -168,7 +232,16 @@ def build_parser() -> argparse.ArgumentParser:
     optimization.add_argument("--grad-accumulation-steps", type=int, default=8)
     optimization.add_argument("--learning-rate", type=float, default=2e-4)
     optimization.add_argument("--weight-decay", type=float, default=0.01)
-    optimization.add_argument("--max-grad-norm", type=float, default=1.0)
+    optimization.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=5.0,
+        help=(
+            "Gradient-norm clipping threshold. The inverse-time weighting gives "
+            "the loss a long tail, so clipping is necessary; 5.0 comes from the "
+            "gradient diagnostic, which found 1.0 clipped too aggressively."
+        ),
+    )
     optimization.add_argument("--warmup-ratio", type=float, default=0.05)
     optimization.add_argument("--min-lr-ratio", type=float, default=0.1)
     optimization.add_argument(
@@ -522,14 +595,37 @@ def set_global_seed(seed: int) -> None:
 
 
 def build_model_config(args: argparse.Namespace) -> MaskedDiffusionModelConfig:
-    performer = PerformerConfig(
-        num_layers=args.num_layers,
-        num_random_features=args.num_random_features,
-        sequence_chunk_size=args.sequence_chunk_size,
-        dropout=args.dropout,
-        projection_seed=args.seed,
-        activation_checkpointing=args.activation_checkpointing,
-    )
+    """Assemble the typed configuration for the selected backbone variant.
+
+    Each variant carries only the knobs it actually reads, so a serialized
+    configuration cannot record a value the model ignores.
+    """
+
+    variant = args.backbone_variant
+    backbone_type = BACKBONE_CONFIG_TYPES[variant]
+    shared = {
+        "num_layers": args.num_layers,
+        "num_random_features": args.num_random_features,
+        "sequence_chunk_size": args.sequence_chunk_size,
+        "dropout": args.dropout,
+        "projection_seed": args.seed,
+        "activation_checkpointing": args.activation_checkpointing,
+    }
+    extra: dict[str, Any] = {}
+    if "expert_ffn_multiplier" in backbone_type.__dataclass_fields__:
+        extra["expert_ffn_multiplier"] = args.expert_ffn_multiplier
+    backbone = backbone_type(**shared, **extra)
+
+    ppi = None
+    if variant in PPI_BACKBONE_VARIANTS:
+        ppi = PPIAssetConfig(
+            embedding_path=args.ppi_embedding_path,
+            embedding_manifest_path=args.ppi_embedding_manifest_path,
+            routing_path=args.ppi_routing_path,
+            routing_manifest_path=args.ppi_routing_manifest_path,
+            verify_sha256=args.verify_ppi_asset_sha256,
+        )
+
     identity = GeneIdentityEncoderConfig(
         weights_path=args.gene_weights_path,
         manifest_path=args.gene_manifest_path,
@@ -537,7 +633,26 @@ def build_model_config(args: argparse.Namespace) -> MaskedDiffusionModelConfig:
         projection_seed=args.seed,
         verify_sha256=args.verify_gene_asset_sha256,
     )
-    return MaskedDiffusionModelConfig(performer=performer, gene_identity=identity)
+    return MaskedDiffusionModelConfig(
+        backbone=backbone,
+        backbone_variant=variant,
+        ppi=ppi,
+        gene_identity=identity,
+    )
+
+
+def ppi_asset_contract(
+    model: MaskedDiffusionTrainingModule,
+) -> Optional[dict[str, Any]]:
+    """Provenance of the shared PPI tables, stored beside the data contract.
+
+    Returns ``None`` for the Performer baseline, which reads no PPI asset.
+    """
+
+    assets = getattr(model.denoiser.backbone, "shared_assets", None)
+    if assets is None or assets.asset_metadata is None:
+        return None
+    return assets.asset_metadata.asset_contract()
 
 
 def build_scheduler(
@@ -676,11 +791,12 @@ def checkpoint_payload(
 ) -> dict[str, Any]:
     return {
         "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
-        "architecture_version": ARCHITECTURE_VERSION,
+        "architecture_version": model_config.architecture_version,
         "reason": reason,
         "model_config": jsonable(asdict(model_config)),
         "training_signature": training_signature(args),
         "data_contract": data_contract,
+        "ppi_asset_contract": ppi_asset_contract(model),
         "current_epoch": current_epoch,
         "epoch_completed": epoch_completed,
         "next_epoch": next_epoch,
@@ -713,12 +829,16 @@ def validate_resume_checkpoint(
     model_config: MaskedDiffusionModelConfig,
     args: argparse.Namespace,
     data_contract: dict[str, Any],
+    resumed_ppi_asset_contract: Optional[dict[str, Any]] = None,
 ) -> None:
     if payload.get("checkpoint_format_version") != CHECKPOINT_FORMAT_VERSION:
         raise ValueError("Unsupported checkpoint format version.")
-    if payload.get("architecture_version") != ARCHITECTURE_VERSION:
+    if payload.get("architecture_version") != model_config.architecture_version:
         raise ValueError(
-            "Checkpoint architecture does not match the hurdle-decoder model."
+            "Checkpoint architecture "
+            f"{payload.get('architecture_version')!r} does not match the "
+            f"architecture selected on this command line, "
+            f"{model_config.architecture_version!r}."
         )
     if payload.get("model_config") != jsonable(asdict(model_config)):
         raise ValueError("Checkpoint model configuration differs from current CLI.")
@@ -726,6 +846,16 @@ def validate_resume_checkpoint(
         raise ValueError("Checkpoint training schedule differs from current CLI.")
     if payload.get("data_contract") != data_contract:
         raise ValueError("Checkpoint data contract differs from the selected dataset.")
+    # The PPI tables live inside the checkpoint, so a resumed run keeps the
+    # checkpoint's tensors regardless of what is on disk now. Comparing the
+    # recorded provenance stops a regenerated artifact from being written into
+    # the next checkpoint as though it described those tensors.
+    if payload.get("ppi_asset_contract") != resumed_ppi_asset_contract:
+        raise ValueError(
+            "Checkpoint PPI asset provenance differs from the assets this run "
+            "loaded; the checkpoint's own tensors would be kept while the new "
+            "digests were recorded against them."
+        )
     if payload.get("primary_validation_metric") != PRIMARY_VALIDATION_METRIC:
         raise ValueError("Checkpoint primary validation metric is incompatible.")
 
@@ -1004,6 +1134,12 @@ def train_one_epoch(
             # Every model loss is normalized by its local B*G. Weighting by the
             # number of cells keeps the accumulated gradient normalized by the
             # full group's cell-gene count, including a smaller final batch.
+            #
+            # ``output.aux_losses`` is deliberately not added here: every block
+            # type in this repository returns an empty mapping, because the MoE
+            # routing is static and needs no load-balancing term. A future block
+            # that does produce an auxiliary loss must be combined in explicitly
+            # at this line, or its gradient will be dropped silently.
             loss = output.loss * (microbatch_cells / group_cells)
         # ``loss`` is ``weighted_nll_sum / normalizer`` with a positive integer
         # normalizer, so the host-side sum decides finiteness.  Reusing the
@@ -1291,6 +1427,7 @@ def main() -> int:
             model_config=model_config,
             args=args,
             data_contract=data_contract,
+            resumed_ppi_asset_contract=ppi_asset_contract(model),
         )
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -1312,10 +1449,12 @@ def main() -> int:
         )
 
     run_config = {
-        "architecture_version": ARCHITECTURE_VERSION,
+        "architecture_version": model_config.architecture_version,
+        "backbone_variant": model_config.backbone_variant,
         "arguments": vars(args),
         "model_config": asdict(model_config),
         "data_contract": data_contract,
+        "ppi_asset_contract": ppi_asset_contract(model),
         "parameter_count": parameter_count,
         "trainable_parameter_count": trainable_parameter_count,
         "device": torch.cuda.get_device_name(device),

@@ -2,11 +2,22 @@
 
 Training checkpoints intentionally contain optimizer, scheduler and RNG state
 for exact recovery.  Inference needs none of those objects.  This module reads
-the existing v3 container, validates its model/data contracts, reconstructs the
-network directly from the learned gene-embedding tensor stored in the
-``state_dict``, and copies only model tensors into a fresh module.
+the v4 container, validates its model/data/asset contracts, reconstructs the
+network directly from the tensors stored in the ``state_dict``, and copies only
+model tensors into a fresh module.
 
-The v3 training format contains NumPy RNG objects and therefore cannot be read
+Nothing here is rebuilt from the original data directory: the learned gene
+embedding and — for the PPIL variants — the two shared PPI tables all travel
+inside the checkpoint, so a trained model is self-contained.
+
+Whether a checkpoint's weights fit this code is answered structurally, in
+layers: the format version, then the parsed architecture identifier, then the
+identifier against the configuration stored beside it, then the *constructed*
+backbone against that identifier, and finally the strict state-dict load.  The
+fourth check is the one that compares against blocks that really exist rather
+than against a string a checkpoint asserts about itself.
+
+The v4 training format contains NumPy RNG objects and therefore cannot be read
 with PyTorch's restricted ``weights_only=True`` unpickler.  Callers must make an
 explicit trust decision before ordinary pickle deserialization.  Never load an
 untrusted checkpoint.
@@ -18,14 +29,19 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 import re
-from typing import Any, Mapping, Union
+from typing import Any, Mapping, Optional, Union
 
 import torch
 from torch import Tensor
 
-from src.models.backbone import build_performer_backbone
+from src.models.architecture import (
+    backbone_signature_from_model,
+    verify_architecture_version,
+)
+from src.models.backbone import build_denoiser_backbone
 from src.models.config import (
-    ARCHITECTURE_VERSION,
+    BACKBONE_CONFIG_TYPES,
+    BACKBONE_VARIANTS,
     NUM_GENES,
     DecoderConfig,
     ForwardProcessConfig,
@@ -33,6 +49,7 @@ from src.models.config import (
     GeneIdentityEncoderConfig,
     LossConfig,
     MaskedDiffusionModelConfig,
+    PPIAssetConfig,
     PerformerConfig,
 )
 from src.models.gene_expression_decoder import GeneExpressionDecoder
@@ -42,10 +59,11 @@ from src.models.losses import TimeWeightedHurdleNLLLoss
 from src.models.masked_diffusion_training import MaskedDiffusionTrainingModule
 from src.models.masked_expression_denoiser import MaskedExpressionDenoiser
 from src.models.masking import AbsorbingMaskForwardProcess, AbsorbingStateEmbedding
+from src.models.ppi_assets import build_ppi_assets
 from src.utils.checkpoint import sha256_file
 
 
-SUPPORTED_CHECKPOINT_FORMAT_VERSION = 3
+SUPPORTED_CHECKPOINT_FORMAT_VERSION = 4
 PRIMARY_VALIDATION_METRIC = "val_time_weighted_hurdle_nll"
 _IDENTITY_WEIGHT_KEY = "denoiser.gene_identity_encoder.embedding.weight"
 
@@ -67,6 +85,19 @@ class InferenceCheckpointMetadata:
     best_primary_validation_metric: float
     model_config: MaskedDiffusionModelConfig
     data_contract: dict[str, Any]
+    ppi_asset_contract: Optional[dict[str, Any]]
+
+    @property
+    def backbone_variant(self) -> str:
+        """Which of the interchangeable backbones these weights belong to."""
+
+        return self.model_config.backbone_variant
+
+    @property
+    def backbone_signature(self) -> str:
+        """Run-length block composition, e.g. ``ppil_full*6``."""
+
+        return self.model_config.backbone_signature
 
 
 @dataclass(frozen=True)
@@ -104,29 +135,63 @@ def _component(
 
 
 def deserialize_model_config(value: Any) -> MaskedDiffusionModelConfig:
-    """Recreate the frozen nested config stored as JSON-compatible mappings."""
+    """Recreate the frozen nested config stored as JSON-compatible mappings.
+
+    ``backbone_variant`` is read first because it selects which dataclass the
+    ``backbone`` mapping is deserialized into.  ``architecture_version`` is no
+    longer stored inside ``model_config``: it is derived from the reconstructed
+    configuration, so a checkpoint cannot carry an identifier that contradicts
+    the architecture it describes.
+    """
 
     raw = _require_mapping(value, name="model_config")
     expected = {
-        "performer",
+        "backbone",
+        "backbone_variant",
+        "ppi",
         "gene_identity",
         "gene_expression",
         "forward_process",
         "decoder",
         "loss",
-        "architecture_version",
     }
     if set(raw) != expected:
         missing = sorted(expected - set(raw))
         unexpected = sorted(set(raw) - expected)
         raise ValueError(
-            "model_config keys do not match the v2 contract; "
+            "model_config keys do not match the v4 contract; "
             f"missing={missing}, unexpected={unexpected}."
+        )
+
+    variant = raw["backbone_variant"]
+    if variant not in BACKBONE_VARIANTS:
+        raise ValueError(
+            f"Unknown model_config.backbone_variant={variant!r}; expected one of "
+            f"{BACKBONE_VARIANTS}."
+        )
+    backbone_type = BACKBONE_CONFIG_TYPES[variant]
+
+    ppi_raw = raw["ppi"]
+    if ppi_raw is None:
+        ppi_config = None
+    else:
+        ppi_config = _component(
+            raw,
+            "ppi",
+            PPIAssetConfig,
+            path_fields=(
+                "embedding_path",
+                "embedding_manifest_path",
+                "routing_path",
+                "routing_manifest_path",
+            ),
         )
 
     try:
         return MaskedDiffusionModelConfig(
-            performer=_component(raw, "performer", PerformerConfig),
+            backbone=_component(raw, "backbone", backbone_type),
+            backbone_variant=variant,
+            ppi=ppi_config,
             gene_identity=_component(
                 raw,
                 "gene_identity",
@@ -145,7 +210,6 @@ def deserialize_model_config(value: Any) -> MaskedDiffusionModelConfig:
             ),
             decoder=_component(raw, "decoder", DecoderConfig),
             loss=_component(raw, "loss", LossConfig),
-            architecture_version=raw["architecture_version"],
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid model_config: {exc}") from exc
@@ -169,6 +233,44 @@ def _validate_state_dict(value: Any) -> Mapping[str, Tensor]:
         if tensor.is_floating_point() and not bool(torch.isfinite(tensor).all().item()):
             raise ValueError(f"Checkpoint model tensor {name!r} is non-finite.")
     return value
+
+
+def _validate_ppi_asset_contract(
+    value: Any,
+    *,
+    config: MaskedDiffusionModelConfig,
+) -> Optional[dict[str, Any]]:
+    """Check the recorded PPI asset provenance against the recovered config.
+
+    The tensors themselves come from the state dict, so the two digests here
+    are provenance for the audit trail rather than a load-time dependency; the
+    structural fields are what must agree with the model being built.
+    """
+
+    if config.ppi is None:
+        if value is not None:
+            raise ValueError(
+                "Checkpoint records a PPI asset contract but its backbone "
+                f"({config.backbone_variant!r}) does not read the PPI assets."
+            )
+        return None
+
+    contract = _require_mapping(value, name="ppi_asset_contract")
+    for name in ("embedding_sha256", "routing_sha256"):
+        digest = contract.get(name)
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None
+        ):
+            raise ValueError(f"Checkpoint ppi_asset_contract.{name} is invalid.")
+    for name in ("num_genes", "embedding_rank", "num_experts", "route_top_k"):
+        expected = getattr(config.ppi, name)
+        if contract.get(name) != expected:
+            raise ValueError(
+                f"Checkpoint ppi_asset_contract.{name}={contract.get(name)!r} "
+                f"does not match the model configuration value {expected!r}."
+            )
+    return contract
 
 
 def _build_model_from_state(
@@ -198,12 +300,13 @@ def _build_model_from_state(
         config.gene_identity,
         initial_weight.detach().cpu(),
     )
-    denoiser = MaskedExpressionDenoiser(
+    # The PPI tables are in the state dict too, so the artifacts on disk are
+    # never reopened here; placeholders of the right shape are filled by the
+    # strict load below, which then rebuilds the derived routing index.
+    denoiser = MaskedExpressionDenoiser.assemble(
+        config,
         gene_identity_encoder=identity_encoder,
-        gene_expression_encoder=GeneExpressionEncoder(config.gene_expression),
-        absorbing_state_embedding=AbsorbingStateEmbedding(config.performer.d_model),
-        backbone=build_performer_backbone(config.performer),
-        decoder=GeneExpressionDecoder(config.decoder),
+        ppi_assets=build_ppi_assets(config, load_from_disk=False),
     )
     model = MaskedDiffusionTrainingModule(
         denoiser=denoiser,
@@ -236,17 +339,30 @@ def load_inference_checkpoint(
     *,
     device: Union[str, torch.device] = "cpu",
     trust_checkpoint: bool = False,
+    expected_backbone_variant: Optional[str] = None,
 ) -> LoadedInferenceModel:
-    """Strictly load only model weights from a trusted v3 training checkpoint.
+    """Strictly load only model weights from a trusted v4 training checkpoint.
 
     ``trust_checkpoint=True`` is mandatory because the current training
     container needs unrestricted pickle deserialization.  It must only be used
     for a checkpoint created by this project and obtained from a trusted path.
     Optimizer, scheduler, scaler and RNG objects are never restored.
+
+    ``expected_backbone_variant`` is an optional caller assertion: when the
+    caller knows which of the interchangeable backbones it means to load, a
+    mismatch is reported by name instead of surfacing later as a wall of
+    missing state-dict keys.
     """
 
     if not isinstance(trust_checkpoint, bool):
         raise TypeError("trust_checkpoint must be a boolean.")
+    if expected_backbone_variant is not None and (
+        expected_backbone_variant not in BACKBONE_VARIANTS
+    ):
+        raise ValueError(
+            f"Unknown expected_backbone_variant={expected_backbone_variant!r}; "
+            f"expected one of {BACKBONE_VARIANTS}."
+        )
     if not trust_checkpoint:
         raise ValueError(
             "Refusing to deserialize an untrusted training checkpoint. Pass "
@@ -287,14 +403,23 @@ def load_inference_checkpoint(
             f"expected {SUPPORTED_CHECKPOINT_FORMAT_VERSION}, got {version!r}."
         )
     architecture = payload.get("architecture_version")
-    if architecture != ARCHITECTURE_VERSION:
-        raise ValueError(
-            f"Checkpoint architecture {architecture!r} is incompatible with "
-            f"{ARCHITECTURE_VERSION!r}."
-        )
     config = deserialize_model_config(payload.get("model_config"))
-    if config.architecture_version != architecture:
-        raise ValueError("Checkpoint top-level and model-config architectures differ.")
+    # Parses the identifier against this code revision, then pins it to the
+    # configuration stored beside it.  There is deliberately no comparison
+    # against a single frozen literal: that could not distinguish the backbones.
+    verify_architecture_version(
+        architecture,
+        config=config,
+        context="Inference checkpoint",
+    )
+    if expected_backbone_variant is not None and (
+        config.backbone_variant != expected_backbone_variant
+    ):
+        raise ValueError(
+            f"Checkpoint holds {config.backbone_variant!r} weights but "
+            f"{expected_backbone_variant!r} was requested; these are different "
+            "models and their weights are not interchangeable."
+        )
 
     data_contract = _require_mapping(
         payload.get("data_contract"),
@@ -309,8 +434,22 @@ def load_inference_checkpoint(
     ):
         raise ValueError("Checkpoint gene_order_sha256 is invalid.")
 
+    ppi_asset_contract = _validate_ppi_asset_contract(
+        payload.get("ppi_asset_contract"),
+        config=config,
+    )
+
     state_dict = _validate_state_dict(payload.get("model"))
     model = _build_model_from_state(config, state_dict)
+    # The strict load above already rejects a structural mismatch; this compares
+    # the identifier against the blocks that were really constructed, which is
+    # the check no self-asserted string can substitute for.
+    built_signature = backbone_signature_from_model(model.denoiser.backbone)
+    if built_signature != config.backbone_signature:
+        raise ValueError(
+            f"Constructed backbone {built_signature!r} does not match the "
+            f"checkpoint architecture {config.backbone_signature!r}."
+        )
     model.to(target_device)
     model.eval()
 
@@ -356,6 +495,7 @@ def load_inference_checkpoint(
         best_primary_validation_metric=float(best_metric),
         model_config=config,
         data_contract=data_contract,
+        ppi_asset_contract=ppi_asset_contract,
     )
     return LoadedInferenceModel(model=model, metadata=metadata)
 

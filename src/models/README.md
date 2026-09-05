@@ -45,16 +45,170 @@ The standard mixer is a non-causal softmax FAVOR+ Performer with eight
 boundary remains `[B,G,512] -> [B,G,512]`; later hierarchical blocks may change
 resolution internally only.
 
+## Backbone variants
+
+The backbone is selected with `--backbone-variant`. The four variants share
+every dimension above and differ only in the mixer and the feed-forward layer,
+so an ablation isolates one change at a time.
+
+| variant | mixer | feed-forward | PPI assets read |
+| --- | --- | --- | --- |
+| `performer` | FAVOR+ | dense `d -> 4d -> d` | none |
+| `ppil_attention` | PPI linear attention | dense `d -> 4d -> d` | spherical embedding |
+| `ppil_ffn` | FAVOR+ | statically routed MoE | routing table |
+| `ppil_full` | PPI linear attention | statically routed MoE | both |
+
+`blocks/ppil_components.py` holds the only implementation of the two new
+components; the three `blocks/ppil_*.py` files assemble them into the shared
+pre-normalized residual shell. `blocks/performer.py` is unchanged, and
+`ppil_ffn` imports its `PerformerSelfAttention` rather than copying it.
+
+Two gene-indexed artifacts back the PPIL variants:
+
+```text
+data/processed/PPI/spherical_ppi_tau700_k4_b1_r64.safetensors
+    embedding    float32 [19295,64], every row on the unit sphere
+    free_mask    bool    [19295],    3,688 degenerate (ballast) rows
+data/processed/PPI/ppi_moe_routing.safetensors
+    expert_ids   int64   [19295,2],  ascending, so column 0 is not the top expert
+    weights      float32 [19295,2],  rows sum to one
+    prototypes   float32 [4,64]
+```
+
+Row `i` of both is gene `i` of the same 19,295-gene axis the denoiser uses, so
+no identifier remapping exists anywhere in the model; the loader verifies the
+`gene_ids == arange(19295)` self-assertion rather than trusting the filename.
+The backbone owns one `PPIAssets` module and hands it to every block by
+reference, so the state dict holds exactly one 5.17 MiB copy however many
+layers are stacked. Those tensors are persistent buffers, so inference never
+reopens `data/`.
+
+Routing is fixed offline, per gene: there is no gating network, no router
+logits and no load-balancing auxiliary loss, and every PPIL block returns an
+empty `aux_losses`. A gene's output is the convex combination of its two
+experts under the table's own weights, which sum to one; the free genes carry
+exactly `0.5/0.5` there, so the code reads the table rather than special-casing
+them.
+
+Two properties of the shipped table are worth knowing when reading ablation
+results. The final per-expert load is `[9668, 9555, 9592, 9775]` — max over min
+is 1.023 — but experts 1 and 2 are each about 38.5% ballast, because all 3,688
+free genes were water-filled into them, which dilutes whatever those two mean.
+And although `T_route=0.03` is a sharp temperature, the routing is mostly not
+near-deterministic: among real genes the dominant weight has median 0.6055 and
+only 2.7% of them exceed 0.99.
+
+## PPI linear attention
+
+The mixer interpolates content attention with the PPI structural prior. Writing
+`z_i` for gene `i` on the unit sphere, the approximated kernel is
+
+```text
+q~_i . k~_j = (1-lambda) * q_i.k_j  +  lambda * sigma_q * sigma_k * (z_i.z_j)
+```
+
+realized by feeding augmented vectors to the usual positive feature map:
+
+```text
+q~_i = [ sqrt(1-lambda) * q_i ; sqrt(lambda) * sigma_q * z_i ]   in R^(d_h+r)
+k~_j = [ sqrt(1-lambda) * k_j ; sqrt(lambda) * sigma_k * z_j ]
+```
+
+so the random projection is `[256,128]` instead of `[256,64]` while the number
+of random features is unchanged. `sigma_q` and `sigma_k` are stop-gradient
+within-head RMS norms taken over the whole gene axis. They calibrate the PPI
+half to the magnitude of the content half, which makes `E||q~_i||^2 = sigma_q^2`
+for a fitted gene *independently of lambda*: lambda reallocates share without
+changing scale. That is why the augmented vector must never be rescaled a
+second time by its own width `d_h+r` — the only dimensional scaling is the
+single `d_h^-1/4` on the content half.
+
+`lambda(p_t) in (0,1)^h` is the prior share, one value per attention head per
+cell. It is produced by each layer's own gate from the *realized* mask rate
+`p_t = mean(diffusion_mask)` — the quantity the reverse sampler can actually
+observe at every step — through a Fourier representation with one band per
+head:
+
+```text
+gamma(p_t) = [sin(2^0 pi p_t), cos(2^0 pi p_t), ..., sin(2^7 pi p_t), cos(2^7 pi p_t)]
+lambda     = sigmoid( Linear(64,8) . SiLU . Linear(16,64) ( gamma(p_t) ) )
+```
+
+The backbone derives `p_t` and `gamma` once per forward pass, since they are
+identical for every layer, and passes them through `DenoiserContext`; the gate
+itself is per-layer. Both square roots are evaluated as `exp(0.5*logsigmoid())`
+rather than `sqrt(sigmoid())`, which is the same number without the infinite
+derivative that FP32 sigmoid saturation would otherwise produce.
+
+Free (ballast) genes get a zero vector in the `r` block. Their rows are unit
+vectors in the artifact exactly like the fitted ones, so without this they
+would contribute full-magnitude spurious similarity — self-similarity exactly
+1.0. Their content half still carries `sqrt(1-lambda)`, so as lambda grows
+their logits contract and their attention flattens toward uniform. This is a
+deliberate, measured consequence, not an oversight.
+
+Three arithmetic details differ from `blocks/performer.py` and are intentional.
+The stabilizing shifts `c_Q` (per token) and `c_K` (one global scalar per batch
+and head) are maxima over the *complete* log-feature including its norm term,
+which makes the largest exponent exactly zero; both cancel between the
+numerator and denominator and so cannot change the result. No per-coordinate
+constant is added inside the feature map, because such a constant gives the
+approximated kernel a uniform background unrelated to both content and PPI that
+then accumulates linearly over all 19,295 keys. The denominator uses `+ epsilon`
+rather than `clamp_min(epsilon)`, which is differentiable everywhere.
+
+Because `sigma` is defined over the whole gene axis, the attention makes four
+chunked passes rather than the Performer's three: one to accumulate the RMS
+norms, one for the global key shift, one for the key/value sufficient
+statistics, and one for the query outputs.
+
+## Statically routed feed-forward
+
+Each expert repeats the dense network's shape exactly: up to the expert width,
+GELU, the same internal dropout, back down to `d_model`, both projections
+biased. Only the sharing pattern differs — the dense network applies one map to
+every gene, the routed one applies a gene-dependent convex mixture of four.
+
+The expert width is `expert_ffn_multiplier * d_model` and is set to 2, giving
+`512 -> 1024 -> 512`. That choice is what makes the ablation clean: under top-2
+routing it holds *three* quantities equal to the dense baseline at once.
+
+```text
+                          dense        w=2 experts
+per-token MAC             2,097,152    2,097,152     (1.00x)
+per-token hidden units    2,048        2,048         (1.00x)
+parameters per gene       2,099,712    2,100,224     (1.00x, +0.02% from biases)
+distinct parameters       2,099,712    4,200,448     (2.00x)
+```
+
+Only the last row grows, and it grows because different genes use different
+maps — which is the hypothesis under test, not a confound. The routing is
+frozen, so an expert only ever sees its own fixed ~9,600 genes and no gene can
+reach beyond its two: the doubled total is the bookkeeping cost of letting gene
+groups differ, not capacity any single gene can draw on. That argument would
+not hold for a learned gate.
+
+Matching *total* parameters instead would mean width `1d`, which halves the
+per-gene parameters, the hidden width and the compute all at once; a loss there
+could not be attributed to the routing rather than to the smaller network.
+
+The routing weights multiply the expert outputs in the residual-stream dtype.
+Under BF16 autocast that rounds each weight by 0.10% at the median (0.39% worst
+case) and leaves a per-gene gain error of at most 0.20%, which sits below the
+0.14% median error BF16 already imposes on the expert outputs themselves;
+weighting in FP32 would cost a 1.26 GB transient per expert for no real gain.
+
 The aggressive training default uses sequence chunks of 8,192 tokens and does
 not enable block-level activation checkpointing. Chunking still bounds the live
 forward feature-map workspace. Activation checkpointing remains a supported
 fallback for configurations that exceed the available accelerator memory.
 
-Time is deliberately not injected into the expression/identity embeddings,
-Performer blocks, or decoder. Every block still receives
-`DenoiserContext(diffusion_time, diffusion_mask)` to keep the interface open to
-future blocks. The current objective, however, uses the exact supplied time;
-time is not inferred from the observed mask count for loss weighting.
+Diffusion time is not injected into the expression/identity embeddings, into
+any block, or into the decoder. The PPIL attention variants do consume the
+context, but through the *realized mask rate* derived from `diffusion_mask`,
+never through `diffusion_time` itself; the Performer consumes neither. The
+objective uses the exact supplied time, and time is never inferred from the
+observed mask count for loss weighting.
 
 ## Three-channel hurdle decoder
 
@@ -188,18 +342,65 @@ all-reduce a differentiable numerator in place.
 
 The probabilistic decoder has `3*512+3 = 1,539` trainable parameters, compared
 with 513 in the former scalar linear head: an increase of only 1,026 parameters.
-For the fixed dimensions in this package, the total trainable-parameter count is
+For the fixed dimensions in this package, the total parameter count is
 
 ```text
-N(L) = 22,837,699 + 3,150,848 * L,
+N(L) = 22,837,699 + P * L
+P = 3,150,848   performer
+P = 3,152,456   ppil_attention
+P = 5,251,584   ppil_ffn
+P = 5,253,192   ppil_full
 ```
 
-where `L` is the number of Performer blocks. For example, `L=6` gives
-41,742,787 trainable parameters. Random-feature projection matrices are fixed
-buffers and are not included. Decoder tensor shapes and loss semantics changed,
-so the architecture version is
-`masked-expression-diffusion-v2-hurdle-truncated-normal`; a former scalar-head
-checkpoint must not be loaded as a strict v2 checkpoint.
+where `L` is the number of blocks. For example, `performer` at `L=6` gives
+41,742,787 parameters, of which 19,514,947 are trainable; the 19,295x1,152
+Geneformer table is frozen. Random-feature projection matrices and the PPI
+tables are fixed buffers and are not included in `P`.
+
+`ppil_attention` adds only its 1,608-parameter prior gate per layer
+(`16->64->8` with biases): the PPI term itself enters through a wider fixed
+random projection, not through new weights. The routed variants add 2,100,736
+parameters per layer, because four experts of width `2d` replace one dense
+network of width `4d` while per-token compute is unchanged under top-2 routing.
+
+## Architecture identifier
+
+The identifier is three `|`-separated segments with the backbone first:
+
+```text
+ppil_full*6|masked-expression-diffusion-v2|hurdle-truncated-normal+inverse-t-nll
+```
+
+The backbone segment names the block variant and how many layers of it exist,
+and `MaskedDiffusionModelConfig.architecture_version` derives it rather than
+storing it, so a configuration cannot carry an identifier that contradicts it.
+Nothing compares against a single frozen literal: identifiers are parsed
+(`src/models/architecture.py`), and the backbone segment is checked against the
+blocks that were actually constructed, both when a backbone is built and after
+a checkpoint is loaded.
+
+A stack is always L layers of one variant. Mixing block types was a possibility
+an earlier design left open; it has been dropped, and the identifier grammar was
+narrowed to match, so what an identifier can express and what the builder can
+produce are the same set. A hand-assembled mixed stack is rejected rather than
+described.
+
+Whether a checkpoint's weights fit this code is therefore answered in layers:
+the format version, the parsed identifier, the identifier against the stored
+configuration, the constructed backbone against that identifier, and finally
+the strict state-dict load. `sample_masked_diffusion.py` also accepts
+`--expect-backbone-variant` so a caller can assert which of the four models it
+means to sample.
+
+The checkpoint container is format 4. Its `model_config` holds `backbone`,
+`backbone_variant` and `ppi` beside the unchanged component sections;
+`architecture_version` is not stored there, because it is derived. A top-level
+`ppi_asset_contract` records both artifacts' SHA-256 alongside the routing
+shape.
+
+Only the current format is supported. Checkpoints written by earlier revisions
+are rejected by the version check rather than migrated, and no migration path
+is maintained: the project retrains instead of carrying old weights forward.
 
 ## Reverse sampling
 
@@ -235,7 +436,7 @@ for a fixed software/hardware configuration and batching choice.
 checkpoint, verifies its 19,295-gene order, generates cells in bounded batches,
 and atomically writes a CSR-backed `.h5ad`. The output remains in the processed
 PBS expression domain used for training; it is not a raw integer-count matrix.
-Training checkpoint v3 contains Python/NumPy RNG objects, so the CLI requires
+Training checkpoint v4 contains Python/NumPy RNG objects, so the CLI requires
 an explicit `--trust-checkpoint` confirmation before unrestricted checkpoint
 deserialization. Optimizer, scheduler, scaler, and training RNG states are not
 restored for inference.
@@ -272,10 +473,12 @@ Each job writes one `.h5ad` and its detailed log under a unique directory in
 scratch. The scheduler resolves `#PBS -o outputs/pbs_logs/` before the shell
 script starts, so that directory must already exist when `qsub` is called.
 
-The current Performer still does not numerically consume `diffusion_time`; its
-state changes across reverse steps only through the monotonically shrinking
-mask and newly visible expression values. This is an explicit limitation of
-the v2 baseline, not an omission in the sampler API.
+The Performer does not numerically consume `diffusion_time`; its state changes
+across reverse steps only through the monotonically shrinking mask and newly
+visible expression values. That was an explicit limitation of the v2 baseline
+rather than an omission in the sampler API, and the PPIL attention variants
+address it: their prior gate reads the realized mask rate, which is visible at
+every reverse step, so their behaviour does vary along the trajectory.
 
 ## Runtime dependencies
 

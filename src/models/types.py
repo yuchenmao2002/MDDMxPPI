@@ -19,14 +19,25 @@ from torch import Tensor
 class DenoiserContext:
     """Context available to every interchangeable denoising block.
 
-    The current Performer deliberately ignores ``diffusion_time`` and does not use
-    ``diffusion_mask`` as an attention mask.  Both fields remain in the stable
-    API so future hierarchical blocks can use them without changing the model
-    boundary.
+    The Performer deliberately ignores every field here: it does not consume
+    ``diffusion_time`` and does not use ``diffusion_mask`` as an attention mask.
+    The PPIL blocks do consume the derived mask-rate fields below, which is why
+    they exist in the stable API.
+
+    ``mask_rate`` and ``mask_rate_features`` are derived from ``diffusion_mask``
+    once per forward pass by the backbone, because they are identical for every
+    layer.  ``mask_rate`` is the realized fraction of genes still in the
+    absorbing state; ``mask_rate_features`` is its Fourier representation
+    ``[sin(2^0*pi*p), cos(2^0*pi*p), ..., sin(2^{h-1}*pi*p), cos(2^{h-1}*pi*p)]``
+    with one band per attention head.  Both are ``None`` for backbones whose
+    blocks do not read them, so those paths stay byte-for-byte unchanged.  They
+    carry no gradient: they are a deterministic function of the boolean mask.
     """
 
     diffusion_time: Tensor  # float32 [B], values in [0,1]
     diffusion_mask: Tensor  # bool [B,G], True means absorbing MASK
+    mask_rate: Optional[Tensor] = None  # float32 [B], realized masked fraction
+    mask_rate_features: Optional[Tensor] = None  # float32 [B,2h], Fourier of mask_rate
 
 
 @dataclass

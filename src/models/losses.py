@@ -14,7 +14,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from src.models.config import NUM_GENES, LossConfig
+from src.models.config import LossConfig
 from src.models.types import (
     HurdleDistributionParameters,
     TimeWeightedHurdleNLLOutput,
@@ -30,7 +30,9 @@ _SQRT_TWO = math.sqrt(2.0)
 def _zero_truncated_normal_nll(target: Tensor, location: Tensor, scale: Tensor) -> Tensor:
     r"""
     零截尾正态分布损失
-    返回零截尾正态分布的负对数似然 -log Normal(x | mu,sigma,X>0)
+    返回逐基因的 -log f_+(x; mu, sigma)，其中
+    f_+(x; mu, sigma) = phi((x - mu) / sigma) / (sigma * Phi(mu / sigma))，x > 0，
+    即类 docstring 中 c_i = 1 分支里的密度项。
     Directly evaluating
     .. math::
        \tfrac12(y-z)^2 + \log\sigma + \tfrac12\log(2\pi)
@@ -93,22 +95,48 @@ def _zero_truncated_normal_nll(target: Tensor, location: Tensor, scale: Tensor) 
 
 class TimeWeightedHurdleNLLLoss(nn.Module):
     r"""
-    计算时间加权的 Hurdle NLL 损失
-    For target expression x >= 0 and decoder outputs (a, mu, sigma), sigmoid(a) is the probability that the expression is positive.
-    The per-token NLL is
+    计算时间加权的 Hurdle NLL 损失（逐基因表述）
+
+    解码器为每个基因 i 输出三个通道 (eta, mu, sigma)。基因 i 的条件分布
+    ``p_theta(x_0^i | x_t, t)`` 由零点质量与截断到 (0, inf) 的 Gaussian 组成：
+
     .. math::
-       1[x=0] softplus(a) + 1[x>0]\left(softplus(-a)
-       - \log f_{TN+}(x; \mu, \sigma)\right),
-    where f_TN` is a Normal density conditioned on being strictly positive.
-    With a boolean diffusion mask M and per-cell time t, the returned training scalar is
+       (1 - \pi_t^i) \quad\text{和}\quad \pi_t^i f_+(x_0^i; \mu_t^i, \sigma_t^i),
+       \qquad \pi_t^i = \operatorname{sigmoid}(\eta_t^i),
+
     .. math::
-       L = (B G)^{-1} \sum_{b,i} M_{bi} t_b^{-1} NLL_{bi}.
-    The denominator is always the fixed number of cell-gene positions, never
-    the random masked-token count.
-    A row at ``t=0`` is valid only when it has no masked positions and contributes a differentiable zero.
-    The returned sums are local sufficient statistics.
-    Under DDP, trainers must account for gradient averaging while using the global fixed normalizer;
-    independently averaging rank-local losses is only equivalent when every rank has the same number of cells.
+       f_+(x; \mu, \sigma) = \frac{\phi((x - \mu) / \sigma)}{\sigma\,\Phi(\mu / \sigma)},
+       \qquad x > 0,
+
+    其中 phi 与 Phi 分别是标准 Gaussian 的 PDF 与 CDF。
+    令 ``c_i = 1[x_0^i > 0]`` 表示目标基因是否为观测正值，逐基因 hurdle 负对数密度为
+
+    .. math::
+       \ell_t^i = (1 - c_i)\operatorname{softplus}(\eta_t^i)
+       + c_i\left[\operatorname{softplus}(-\eta_t^i)
+       - \log f_+(x_0^i; \mu_t^i, \sigma_t^i)\right].
+
+    注意两个分支的 logit 符号相反：``softplus(eta) = -log(1 - pi)`` 是零事件的代价，
+    ``softplus(-eta) = -log pi`` 是正事件的代价。
+
+    对线性吸收 schedule ``alpha(t) = 1 - t``，训练目标为
+
+    .. math::
+       \mathcal L_{\mathrm{rec}}(\theta) = \mathbb E_{x_0, t, m_t}
+       \left[\frac{1}{tG}\sum_{i=1}^{G} m_{t,i}\,\ell_{t,i}\right].
+
+    本方法返回该期望的批均值估计：分子是 ``sum_{b,i} M_bi t_b^{-1} ell_bi``，
+    分母是固定的 cell-gene 位置数 ``B*G``，两者相除即
+    ``mean_b[(1/(t_b G)) sum_i m_bi ell_bi]``。分母**恒为固定的位置数**，
+    绝不使用随机的 masked token 计数。
+    ``t=0`` 的行只在其没有任何 masked 位置时合法，并贡献一个可微的零。
+
+    返回的各项和是局部充分统计量。注意 ``weighted_zero_nll_sum`` 与
+    ``weighted_positive_nll_sum`` 的切分是 **c=0 分支与 c=1 分支**，
+    而非「检测项与密度项」——正分支中 ``softplus(-eta)`` 与 ``-log f_+`` 是合并上报的。
+    在 DDP 下，trainer 必须对 detach 后的充分统计量做全局归约，并以全局固定的
+    normalizer 缩放各 rank 的可微分子；只有当每个 rank 的 cell 数相同时，
+    独立平均各 rank 的 loss 才等价。
     """
 
     def __init__(self, config: LossConfig) -> None:
@@ -197,8 +225,11 @@ class TimeWeightedHurdleNLLLoss(nn.Module):
             dtype=torch.int64,
             device=target.device,
         )
+        # 归一化常数是固定的 cell-gene 位置数 B*G，从张量形状推导而非取模块常量：
+        # 公式里的 G 就是本次输入的基因数，写死 NUM_GENES 会让任何其它 G 静默地按
+        # 错误的分母归一而不报错。
         normalizer = torch.tensor(
-            batch_size * NUM_GENES,
+            batch_size * target.shape[1],
             dtype=torch.int64,
             device=target.device,
         )

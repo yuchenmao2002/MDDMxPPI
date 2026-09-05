@@ -1,17 +1,33 @@
-"""Monotone reverse sampling for the absorbing expression diffusion model.
+"""吸收态表达扩散模型的单调反向采样。
 
 This module intentionally owns *sampling policy*, not network architecture or
 training loss.  :class:`ReverseSampler` repeatedly evaluates one trained
-denoiser on a descending time grid.  At each transition, values are sampled
-from the decoder's hurdle zero-truncated-Normal distribution and an independent
-reveal gate permanently moves a subset of MASK tokens into the visible state.
+denoiser on a descending time grid.
 
-The initial implementation supports only the linear forward survival law
-``P(token remains visible at t) = 1 - t``.  Consequently, for a transition
-``current_time -> next_time`` the conditional probability of revealing a token
-that is still masked is
+采样步数为 K，采用线性网格
 
-``(current_time - next_time) / current_time``.
+    t_k = k / K,    k = 0, ..., K
+
+代码按 k 递减枚举（``grid[step_index] = t_{K - step_index}``），初始状态
+``x_{t_K}`` 是全部掩码的序列。前向生存律为 ``P(t 时刻仍被掩码) = t``，
+等价地 ``P(t 时刻可见) = 1 - t``。
+
+在 ``t_k -> t_{k-1}`` 的反向步骤中，每个**仍被掩码**的基因以
+
+    r_k = 1 - t_{k-1} / t_k = 1 / k
+
+的概率被揭示。代码写成 ``(current_time - next_time) / current_time``，
+即从网格自身求 r，而**不是**直接代入闭式 ``1 / k``：这样存活概率的连乘会精确收缩为
+``grid[-1] / grid[0]``，实测各步累计掩码率与 ``t_k`` 的偏差仅 2e-09，比代入闭式更稳。
+由于 ``r_1 = 1``，最后一步揭示全部剩余 MASK；该步在代码中走独立的精确全揭示分支，
+不依赖 ``rand < 1``。
+
+本步新揭示的基因 i 从 hurdle 分布采样
+
+    x_{t_{k-1}}^i | x_{t_k}  ~  (1 - pi_{t_k}^i) delta_0
+                               + pi_{t_k}^i TN_(0,inf)(mu_{t_k}^i, (sigma_{t_k}^i)^2)
+
+三个参数 (pi, mu, sigma) 全部取自**当前时刻 t_k** 的 denoiser 输出。
 
 Already-visible values are immutable.  The reveal gate is independent of the
 hurdle value, so the implementation samples hurdle values lazily only for the
@@ -42,9 +58,10 @@ class SamplingConfig:
     """Configuration of one reverse sampling run.
 
     ``num_steps`` is the number ``K`` of denoiser evaluations.  The descending
-    linear grid contains ``K + 1`` endpoints, including exactly 1 and 0.  Only
-    ``linear`` is accepted until another schedule is paired with a derived
-    reveal transition rather than introduced as an unvalidated heuristic.
+    linear grid is ``t_k = k / K`` for ``k = 0, ..., K``: it contains ``K + 1``
+    endpoints, including exactly 1 and 0.  Only ``linear`` is accepted until
+    another schedule is paired with a derived reveal transition rather than
+    introduced as an unvalidated heuristic.
     """
 
     num_steps: int

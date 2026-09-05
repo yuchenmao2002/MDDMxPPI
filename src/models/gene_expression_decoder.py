@@ -100,6 +100,18 @@ class GeneExpressionDecoder(nn.Module):
             bias=True,
         )
 
+        # 通道 0 是 detection logit eta（chunk 的解包顺序即 F.linear 的输出列顺序）。
+        # 把该行权重置零、bias 设为 logit(p0)，使初始 pi = sigmoid(eta) 对每个基因
+        # 都恰好等于配置的经验先验。只改 bias 是不够的：d=512 使 W·h 的标准差达 0.58，
+        # 会把 pi 撑到 [0.04, 0.41]。梯度仍照常回传（dL/dW = dL/deta * h），
+        # mu 与 rho 两个通道保持 PyTorch 默认初始化。
+        initial_probability = config.initial_detection_probability
+        with torch.no_grad():
+            self.projection.weight[0].zero_()
+            self.projection.bias[0] = math.log(
+                initial_probability / (1.0 - initial_probability)
+            )
+
     def forward(self, hidden_states: Tensor, *, compute_point_prediction: bool = True) -> DecoderOutput:
         """
         Input:

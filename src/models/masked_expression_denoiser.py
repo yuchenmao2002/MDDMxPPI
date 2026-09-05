@@ -6,9 +6,11 @@ It does not sample forward corruption, evaluate the training objective, or run a
 
 from __future__ import annotations
 
+from typing import Optional
+
 from torch import Tensor, nn
 
-from src.models.backbone import DenoiserBackbone, build_performer_backbone
+from src.models.backbone import DenoiserBackbone, build_denoiser_backbone
 from src.models.config import (
     DEFAULT_D_MODEL,
     NUM_GENES,
@@ -18,6 +20,7 @@ from src.models.gene_expression_decoder import GeneExpressionDecoder
 from src.models.gene_expression_encoder import GeneExpressionEncoder
 from src.models.gene_identity_encoder import GeneIdentityEncoder
 from src.models.masking import AbsorbingStateEmbedding
+from src.models.ppi_assets import PPIAssets, build_ppi_assets
 from src.models.types import DenoiserContext, ModelOutput
 
 
@@ -52,20 +55,32 @@ class MaskedExpressionDenoiser(nn.Module):
 
 
     @classmethod
-    def from_config(cls, config: MaskedDiffusionModelConfig) -> "MaskedExpressionDenoiser":
-        """模型实例化"""
+    def assemble(cls, config: MaskedDiffusionModelConfig, *, gene_identity_encoder: GeneIdentityEncoder, ppi_assets: Optional[PPIAssets]) -> "MaskedExpressionDenoiser":
+        """装配去噪器
 
-        gene_identity_encoder = GeneIdentityEncoder.from_config(config.gene_identity)
-        gene_expression_encoder = GeneExpressionEncoder(config.gene_expression)
-        absorbing_state_embedding = AbsorbingStateEmbedding(config.performer.d_model)
-        backbone = build_performer_backbone(config.performer)
-        decoder = GeneExpressionDecoder(config.decoder)
+        The single assembly path.  Training and checkpoint restoration差别只在
+        两个外部来源的部件从哪里来——前者读盘，后者从 state dict 取——所以这两个
+        部件由调用方注入，其余结构在这里一次性组装。
+        Keeping one assembly site is what stops the training-time and
+        inference-time models from silently diverging as variants are added.
+        """
+
         return cls(
             gene_identity_encoder=gene_identity_encoder,
-            gene_expression_encoder=gene_expression_encoder,
-            absorbing_state_embedding=absorbing_state_embedding,
-            backbone=backbone,
-            decoder=decoder,
+            gene_expression_encoder=GeneExpressionEncoder(config.gene_expression),
+            absorbing_state_embedding=AbsorbingStateEmbedding(config.backbone.d_model),
+            backbone=build_denoiser_backbone(config, ppi_assets=ppi_assets),
+            decoder=GeneExpressionDecoder(config.decoder),
+        )
+
+    @classmethod
+    def from_config(cls, config: MaskedDiffusionModelConfig) -> "MaskedExpressionDenoiser":
+        """模型实例化：从磁盘读取并审计外部资产"""
+
+        return cls.assemble(
+            config,
+            gene_identity_encoder=GeneIdentityEncoder.from_config(config.gene_identity),
+            ppi_assets=build_ppi_assets(config, load_from_disk=True),
         )
 
 

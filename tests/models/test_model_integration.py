@@ -7,7 +7,6 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-import src.models.losses as losses_module
 import src.models.masked_diffusion_training as model_module
 import src.models.masked_expression_denoiser as denoiser_module
 from src.models.config import LossConfig
@@ -240,7 +239,6 @@ def test_masked_input_values_have_no_gradient_path(monkeypatch) -> None:
 def test_training_wrapper_state_supply_rules_and_zero_mask(monkeypatch) -> None:
     num_genes = 5
     denoiser = _small_denoiser(monkeypatch, num_genes=num_genes)
-    monkeypatch.setattr(losses_module, "NUM_GENES", num_genes)
     process = _RecordingForwardProcess(num_genes)
     criterion = _RecordingHurdleLoss(TimeWeightedHurdleNLLLoss(LossConfig()))
     model = MaskedDiffusionTrainingModule(
